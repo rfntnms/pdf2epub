@@ -194,6 +194,13 @@ keeps the printed page numbers. The FP8 server misread one word ("rumitnya" as
 "mutinya") once or twice in ~2,400 words, depending on how pages were batched;
 the bf16 transformers engine did not.
 
+On a real scanned book (Indonesian, 841 small pages of ~9.6 x 13.7 cm) the
+vllm engine read 60 pages in 92 s (~1.5 s/page) with only occasional
+single-letter errors. Before sending a page, the engine pads it with white to
+exactly 2:3. vLLM otherwise splits pages that are slightly wider than 2:3 into
+12 or more upscaled 640 px tiles, which ran the 8 GB card out of memory on half
+of that book's pages.
+
 #### `--ocr-engine unlimited` (transformers)
 
 - Needs extra packages: `pip install addict easydict matplotlib torchvision`

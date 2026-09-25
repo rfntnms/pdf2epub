@@ -64,6 +64,30 @@ def _check_server(base_url: str) -> str:
     raise RuntimeError(f"{MODEL_NAME} is not served at {base_url}; found {models}")
 
 
+def pad_to_tile_grid(image):
+    """
+    Pad a page with white to exactly 2:3 (or 3:2 for landscape pages).
+
+    vLLM tiles each image into 640 px crops on the grid (up to 32 crops) whose
+    aspect ratio is closest to the image's, so a book page only slightly wider
+    than 2:3 becomes a 3x4 or 4x5 grid of upscaled crops. Encoding those needs
+    700 MB and more at once, which runs an 8 GB card out of memory. At exactly
+    2:3 the page always gets 6 crops, like an A4 page. Detection boxes are
+    relative to the padded image, so image blocks are cropped from it.
+    """
+    from PIL import Image
+
+    w, h = image.size
+    tw, th = (2, 3) if w <= h else (3, 2)
+    new_w, new_h = max(w, -(-h * tw // th)), max(h, -(-w * th // tw))
+    if (new_w, new_h) == (w, h):
+        return image
+    padded = Image.new(image.mode, (new_w, new_h), "white")
+    padded.paste(image, ((new_w - w) // 2, (new_h - h) // 2))
+    image.close()
+    return padded
+
+
 def _ocr_page(base_url: str, model: str, image) -> tuple[str, str, float]:
     """Send one page image and return (raw output, finish reason, seconds)."""
     started = time.time()
@@ -133,16 +157,20 @@ def convert_pdf(
                 f"request {seconds:.1f}s, elapsed {time.time() - started:.1f}s"
             )
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for idx in pages:
-                image = render_page(pdf, idx)
-                pending.append((idx, image, pool.submit(_ocr_page, base_url, model, image)))
-                while len(pending) >= 2 * workers or pending and pending[0][2].done():
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for idx in pages:
+                    image = pad_to_tile_grid(render_page(pdf, idx))
+                    pending.append((idx, image, pool.submit(_ocr_page, base_url, model, image)))
+                    while len(pending) >= 2 * workers or pending and pending[0][2].done():
+                        finish_oldest()
+                while pending:
                     finish_oldest()
-            while pending:
-                finish_oldest()
+        finally:
+            # Closing here rather than at interpreter exit avoids pdfium's
+            # "library is destroyed" warning when a request fails.
+            pdf.close()
 
-        pdf.close()
         write_output(
             output_dir,
             stem,
