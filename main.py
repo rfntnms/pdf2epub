@@ -44,6 +44,13 @@ def main():
         help='Page number to start from'
     )
     parser.add_argument(
+        '--ocr-engine',
+        choices=['marker', 'unlimited'],
+        default='marker',
+        help='OCR backend: marker (default) or unlimited (Baidu Unlimited-OCR, '
+             'NVIDIA GPU only, meant for scanned PDFs)'
+    )
+    parser.add_argument(
         '--skip-epub',
         action='store_true',
         help='Skip EPUB generation, only create markdown'
@@ -88,7 +95,11 @@ def main():
             # Convert PDF to Markdown unless skipped
             if not args.skip_md:
                 print("Converting PDF to Markdown...")
-                pdf2md.convert_pdf(
+                if args.ocr_engine == 'unlimited':
+                    import modules.unlimited_ocr as converter
+                else:
+                    converter = pdf2md
+                converter.convert_pdf(
                     str(pdf_path),
                     markdown_dir,
                     args.max_pages,

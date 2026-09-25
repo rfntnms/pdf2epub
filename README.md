@@ -133,6 +133,7 @@ python main.py [input_path] [output_path] [options]
 Options:
   --max-pages INT          Maximum number of pages to process
   --start-page INT         Page number to start from
+  --ocr-engine ENGINE      marker (default) or unlimited
   --skip-epub              Skip EPUB generation, only create markdown
   --skip-md                Skip markdown generation, use existing markdown files
 ```
@@ -149,6 +150,29 @@ python main.py book.pdf --start-page 10 --max-pages 50
 Convert to markdown only:
 ```bash
 python main.py thesis.pdf --skip-epub
+```
+
+### Alternative OCR engine: Unlimited-OCR
+
+For scanned PDFs, `--ocr-engine unlimited` uses Baidu's
+[Unlimited-OCR](https://github.com/baidu/Unlimited-OCR) vision-language model
+instead of marker. Every page is rendered and parsed by the model, so it is not
+worth using on digital PDFs, where marker reads the embedded text directly.
+
+- Requires an NVIDIA GPU with a CUDA build of PyTorch (no CPU or MPS support,
+  so it does not work in the CPU Docker image). Peak VRAM is about 7 GB, so an
+  8 GB card is tight; close other GPU-heavy apps.
+- It is slow through transformers: about 60 s per dense page on an RTX 4060,
+  roughly 4x slower than marker. The speed Baidu advertises comes from serving
+  the model with vLLM or SGLang on Linux, which is not wired in here.
+- Needs extra packages: `pip install addict easydict matplotlib`
+- The model (~6.7 GB) is downloaded from HuggingFace on first run. It is
+  loaded with `trust_remote_code=True`, which runs Python code from that
+  HuggingFace repository.
+- Images are cropped from the page render at 200 DPI and saved to `images/`.
+
+```bash
+python main.py scanned_book.pdf --ocr-engine unlimited
 ```
 
 ### Output Structure
