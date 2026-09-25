@@ -133,7 +133,9 @@ python main.py [input_path] [output_path] [options]
 Options:
   --max-pages INT          Maximum number of pages to process
   --start-page INT         Page number to start from
-  --ocr-engine ENGINE      marker (default) or unlimited
+  --ocr-engine ENGINE      marker (default), unlimited or vllm
+  --vllm-url URL           vLLM server for --ocr-engine vllm (default: http://localhost:8000/v1)
+  --vllm-workers INT       Pages sent to the vLLM server at once (default: 8)
   --skip-epub              Skip EPUB generation, only create markdown
   --skip-md                Skip markdown generation, use existing markdown files
 ```
@@ -152,28 +154,110 @@ Convert to markdown only:
 python main.py thesis.pdf --skip-epub
 ```
 
-### Alternative OCR engine: Unlimited-OCR
+### Alternative OCR engines: Unlimited-OCR
 
-For scanned PDFs, `--ocr-engine unlimited` uses Baidu's
+For scanned PDFs, two engines use Baidu's
 [Unlimited-OCR](https://github.com/baidu/Unlimited-OCR) vision-language model
-instead of marker. Every page is rendered and parsed by the model, so it is not
-worth using on digital PDFs, where marker reads the embedded text directly.
+instead of marker. Every page is rendered at 200 DPI and parsed by the model, so
+they are not worth using on digital PDFs, where marker reads the embedded text
+directly. Blocks the model labels as images are cropped from the render and
+saved to `images/`.
 
-- Requires an NVIDIA GPU with a CUDA build of PyTorch (no CPU or MPS support,
-  so it does not work in the CPU Docker image). Peak VRAM is about 7 GB, so an
-  8 GB card is tight; close other GPU-heavy apps.
-- It is slow through transformers: about 60 s per dense page on an RTX 4060,
-  roughly 4x slower than marker. The speed Baidu advertises comes from serving
-  the model with vLLM or SGLang on Linux, which is not wired in here.
-- Needs extra packages: `pip install addict easydict matplotlib`
-- The model (~6.7 GB) is downloaded from HuggingFace on first run. It is
-  loaded with `trust_remote_code=True`, which runs Python code from that
-  HuggingFace repository.
-- Images are cropped from the page render at 200 DPI and saved to `images/`.
+- `--ocr-engine unlimited` loads the model in-process through transformers.
+- `--ocr-engine vllm` sends the pages to a separate vLLM server, several at a
+  time, so vLLM can batch them. This is by far the fastest option for scans.
+
+Both need an NVIDIA GPU (no CPU or MPS support, so neither works in the CPU
+Docker image). The model (~6.7 GB) is downloaded from HuggingFace on first use
+and runs remote code from that repository (`trust_remote_code=True`).
+
+#### Measured speed
+
+Synthetic scanned book (A4 at 200 DPI, Indonesian text, one figure per page),
+RTX 4060 8 GB that also drives the desktop, Fedora 44:
+
+| Engine | 3 pages | 12 pages | Per page (12 pages) | GPU memory |
+|---|---|---|---|---|
+| marker (Surya) | 27 s | 71 s | ~5.9 s (~4 s OCR only) | ~7.3 GB |
+| unlimited (transformers, bf16) | 61 s | 178 s | ~13.9 s | ~7.4 GB |
+| vllm (FP8, 8 workers) | 9.5 s | 15.4 s | ~1.3 s | ~7.4 GB, held while the server runs |
+| vllm (FP8, 12 workers) | – | 12.6 s | ~1.05 s | same |
+
+Times for marker and unlimited include loading the models (~10 s). The vllm
+times exclude starting the server, which takes about 2 minutes (the first start
+also downloads the model), and the first batch after a start runs ~4 s slower.
+
+Quality on these pages: all three read the text correctly. Unlimited-OCR kept
+every heading, while marker dropped the repeated "Bagian N" section headings as
+page headers. Unlimited-OCR leaves headings as plain text rather than `##` and
+keeps the printed page numbers. The FP8 server misread one word ("rumitnya" as
+"mutinya") once or twice in ~2,400 words, depending on how pages were batched;
+the bf16 transformers engine did not.
+
+#### `--ocr-engine unlimited` (transformers)
+
+- Needs extra packages: `pip install addict easydict matplotlib torchvision`
+  (torchvision must match your torch build).
+- Peak VRAM is just under 8 GB. The engine sets
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, without which an 8 GB
+  card runs out of memory on Linux. Close other GPU-heavy apps.
 
 ```bash
 python main.py scanned_book.pdf --ocr-engine unlimited
 ```
+
+#### `--ocr-engine vllm` (vLLM server, Linux)
+
+The client only needs `requests`, which marker already installs. The model runs
+in vLLM's dedicated image (the architecture is not in the regular vLLM wheel),
+following the [vLLM recipe](https://recipes.vllm.ai/baidu/Unlimited-OCR).
+
+GPU access from Podman needs the NVIDIA Container Toolkit and a CDI spec (on
+Fedora, add NVIDIA's repo from `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo`
+to `/etc/yum.repos.d/`, then run `sudo dnf install nvidia-container-toolkit` and
+`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). Then start the
+server and leave it running:
+
+```bash
+podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \
+  --network host --ipc host \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/vllm:/root/.cache/vllm \
+  docker.io/vllm/vllm-openai:unlimited-ocr \
+  baidu/Unlimited-OCR \
+  --trust-remote-code \
+  --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor \
+  --no-enable-prefix-caching \
+  --mm-processor-cache-gb 0 \
+  --quantization fp8 --gpu-memory-utilization 0.85 \
+  --max-model-len 8192 --skip-mm-profiling
+```
+
+It is ready once `curl localhost:8000/v1/models` answers. Then:
+
+```bash
+python main.py scanned_book.pdf --ocr-engine vllm
+```
+
+Notes on the server flags:
+
+- `--security-opt label=disable` lets rootless Podman open the GPU under
+  SELinux; without it `nvidia-smi` in the container fails with "Insufficient
+  Permissions". With Docker, use `--gpus all` instead of `--device` and drop
+  `--security-opt`.
+- The last three lines are for 8 GB cards. In bf16 the weights take 6.2 GB, and
+  each page needs another ~400 MB for the vision encoder, which does not fit
+  next to a KV cache. `--quantization fp8` (RTX 40xx or newer) halves the
+  weights and leaves room for ~33k tokens of KV cache, enough for ~12 pages in
+  flight. `--skip-mm-profiling` is needed because vLLM would otherwise profile a
+  32-tile image, far larger than an A4 page (1 global view + 6 tiles). On a
+  GPU with 16 GB or more, drop these three lines to run the model in bf16.
+- The two cache mounts keep the weights and vLLM's compiled kernels between
+  runs. On an 8 GB card, stop the server before running marker or the
+  transformers engine; it holds the GPU memory while it runs.
+- If the server is not reachable, `--ocr-engine vllm` stops with an error that
+  prints this command.
 
 ### Output Structure
 

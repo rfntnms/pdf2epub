@@ -5,6 +5,22 @@ Claude Code on Fedora should read this whole file first, then do the tasks in
 order. Ask the user before anything that needs `sudo`, a reboot, a push, or a
 merge into `main`.
 
+## Status (2026-09-25, Fedora)
+
+All tasks below are done on branch `unlimited-ocr-backend` (not pushed).
+`--ocr-engine vllm` works on the RTX 4060 at ~1.05–1.3 s per page, versus
+~4–6 s for marker and ~14 s for the transformers engine. The README has the
+working Podman command and the measured numbers. What differed from the plan:
+
+- The recipe's bf16 settings do not fit 8 GB next to the desktop. The server
+  needs `--quantization fp8 --skip-mm-profiling` (see README for why), and
+  rootless Podman needs `--security-opt label=disable` for SELinux.
+- FP8 misreads roughly 1 word in 2,000; the bf16 transformers engine did not.
+- The transformers engine needs `torchvision` and, on Linux,
+  `expandable_segments` (now set inside the module) to avoid running out of
+  memory. It is ~4x faster here than it was on Windows.
+- Only a synthetic scan was tested. Re-check quality on a real scanned book.
+
 ## Why this exists
 
 The user converts **scanned** books with this project. The slow step is

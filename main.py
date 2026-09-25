@@ -45,10 +45,23 @@ def main():
     )
     parser.add_argument(
         '--ocr-engine',
-        choices=['marker', 'unlimited'],
+        choices=['marker', 'unlimited', 'vllm'],
         default='marker',
-        help='OCR backend: marker (default) or unlimited (Baidu Unlimited-OCR, '
-             'NVIDIA GPU only, meant for scanned PDFs)'
+        help='OCR backend: marker (default), unlimited (Baidu Unlimited-OCR '
+             'in-process, NVIDIA GPU only) or vllm (Unlimited-OCR served by a '
+             'running vLLM server); the last two are meant for scanned PDFs'
+    )
+    parser.add_argument(
+        '--vllm-url',
+        default='http://localhost:8000/v1',
+        help='Base URL of the vLLM server for --ocr-engine vllm '
+             '(default: http://localhost:8000/v1)'
+    )
+    parser.add_argument(
+        '--vllm-workers',
+        type=int,
+        default=8,
+        help='Pages sent to the vLLM server at once (default: 8)'
     )
     parser.add_argument(
         '--skip-epub',
@@ -95,8 +108,15 @@ def main():
             # Convert PDF to Markdown unless skipped
             if not args.skip_md:
                 print("Converting PDF to Markdown...")
+                extra = {}
                 if args.ocr_engine == 'unlimited':
                     import modules.unlimited_ocr as converter
+                elif args.ocr_engine == 'vllm':
+                    import modules.vllm_ocr as converter
+                    extra = {
+                        'base_url': args.vllm_url,
+                        'workers': args.vllm_workers,
+                    }
                 else:
                     converter = pdf2md
                 converter.convert_pdf(
@@ -104,6 +124,7 @@ def main():
                     markdown_dir,
                     args.max_pages,
                     args.start_page,
+                    **extra,
                 )
             
             # Convert Markdown to EPUB unless skipped

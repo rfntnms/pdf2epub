@@ -6,12 +6,13 @@ Every page is rendered to an image and parsed by the model, so this backend is
 aimed at scanned PDFs. It requires an NVIDIA GPU with CUDA; the model weights
 (~6.7 GB, bfloat16) are downloaded from HuggingFace on first use.
 
-This runs the model through plain transformers, which is slow: about 60 s per
-dense page on an 8 GB RTX 4060. The speed Baidu advertises comes from serving
-the model with vLLM or SGLang on Linux, which this module does not do.
+This runs the model in-process through plain transformers. The vllm engine
+(modules/vllm_ocr.py) sends the same pages to a vLLM server instead and reuses
+the rendering and post-processing helpers defined here.
 """
 from pathlib import Path
 import json
+import os
 import re
 import sys
 import tempfile
@@ -41,6 +42,10 @@ def _load_model():
     if _model is not None:
         return _model, _tokenizer
 
+    # Peak VRAM sits just under 8 GB; without this, fragmentation alone makes
+    # an 8 GB card run out of memory on Linux. Must be set before CUDA starts.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     import torch
     from transformers import AutoModel, AutoTokenizer
 
@@ -62,10 +67,46 @@ def _load_model():
     return _model, _tokenizer
 
 
-def _page_indices(page_count: int, max_pages: int = None, start_page: int = None) -> list[int]:
+def page_indices(page_count: int, max_pages: int = None, start_page: int = None) -> list[int]:
     start = start_page or 0
     end = page_count if max_pages is None else min(page_count, start + max_pages)
     return list(range(start, end))
+
+
+def render_page(pdf, idx: int):
+    """Render page idx of an open pypdfium2 document to a PIL image."""
+    page = pdf[idx]
+    image = page.render(scale=RENDER_DPI / 72).to_pil()
+    page.close()
+    return image
+
+
+def write_output(
+    output_dir: Path,
+    stem: str,
+    page_texts: list[str],
+    pages: list[int],
+    elapsed: float,
+    engine: str,
+    **extra,
+) -> None:
+    """Write <stem>.md and <stem>_metadata.json the way mark2epub expects."""
+    md_output = output_dir / f"{stem}.md"
+    md_output.write_text("\n\n".join(t for t in page_texts if t), encoding="utf-8")
+    print(f"Markdown saved to: {md_output}")
+
+    metadata = {
+        "ocr_engine": engine,
+        "pages": [i + 1 for i in pages],
+        "seconds_total": round(elapsed, 1),
+        "seconds_per_page": round(elapsed / max(len(pages), 1), 2),
+        **extra,
+    }
+    meta_output = output_dir / f"{stem}_metadata.json"
+    with open(meta_output, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to: {meta_output}")
+    print(f"OCR finished: {len(pages)} pages in {elapsed:.1f}s")
 
 
 def _parse_bbox(raw: str, width: int, height: int):
@@ -145,7 +186,7 @@ def convert_pdf(
         stem = Path(input_path).stem
 
         pdf = pdfium.PdfDocument(input_path)
-        pages = _page_indices(len(pdf), max_pages, start_page)
+        pages = page_indices(len(pdf), max_pages, start_page)
         page_texts = []
         started = time.time()
 
@@ -153,9 +194,7 @@ def convert_pdf(
             tmp_dir = Path(tmp)
             for n, idx in enumerate(pages, 1):
                 page_started = time.time()
-                page = pdf[idx]
-                page_image = page.render(scale=RENDER_DPI / 72).to_pil()
-                page.close()
+                page_image = render_page(pdf, idx)
                 page_path = tmp_dir / f"page_{idx + 1:04d}.png"
                 page_image.save(page_path)
 
@@ -184,23 +223,9 @@ def convert_pdf(
                 )
 
         pdf.close()
-
-        md_output = output_dir / f"{stem}.md"
-        md_output.write_text("\n\n".join(t for t in page_texts if t), encoding="utf-8")
-        print(f"Markdown saved to: {md_output}")
-
-        elapsed = time.time() - started
-        metadata = {
-            "ocr_engine": MODEL_NAME,
-            "pages": [i + 1 for i in pages],
-            "seconds_total": round(elapsed, 1),
-            "seconds_per_page": round(elapsed / max(len(pages), 1), 2),
-        }
-        meta_output = output_dir / f"{stem}_metadata.json"
-        with open(meta_output, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-        print(f"Metadata saved to: {meta_output}")
-        print(f"OCR finished: {len(pages)} pages in {elapsed:.1f}s")
+        write_output(
+            output_dir, stem, page_texts, pages, time.time() - started, MODEL_NAME
+        )
 
     except Exception as e:
         print(f"Error converting {input_path}: {str(e)}", file=sys.stderr)
