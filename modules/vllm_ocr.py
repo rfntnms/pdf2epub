@@ -2,7 +2,8 @@
 OCR backend that sends pages to Baidu's Unlimited-OCR served by vLLM.
 
 The model is not loaded here; it runs in a separate vLLM server (Linux +
-NVIDIA GPU, see README). Each page is rendered to a PNG and posted to the
+NVIDIA GPU, see README), which start_server() launches in Podman when none is
+running. Each page is rendered to a PNG and posted to the
 server's OpenAI-compatible chat endpoint. Several pages are kept in flight so
 vLLM can batch them, which is where the speedup over the transformers engine
 comes from. Rendering and post-processing are shared with modules/unlimited_ocr.
@@ -10,8 +11,11 @@ comes from. Rendering and post-processing are shared with modules/unlimited_ocr.
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 import base64
 import io
+import shutil
+import subprocess
 import sys
 import time
 
@@ -28,8 +32,31 @@ from modules.unlimited_ocr import (
 DEFAULT_URL = "http://localhost:8000/v1"
 DEFAULT_WORKERS = 8
 
+CONTAINER_NAME = "pdf2epub-vllm"
+IMAGE = "docker.io/vllm/vllm-openai:unlimited-ocr"
+STARTUP_TIMEOUT = 20 * 60  # the first start pulls the image and the weights
+
 # Settings that fit an 8 GB card that also drives the desktop; see README for
 # what each memory flag is for and what to drop on a bigger GPU.
+PODMAN_ARGS = [
+    "--device", "nvidia.com/gpu=all",
+    "--security-opt", "label=disable",
+    "--network", "host",
+    "--ipc", "host",
+    "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+]
+VLLM_ARGS = [
+    "--trust-remote-code",
+    "--logits_processors",
+    "vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor",
+    "--no-enable-prefix-caching",
+    "--mm-processor-cache-gb", "0",
+    "--quantization", "fp8",
+    "--gpu-memory-utilization", "0.85",
+    "--max-model-len", "8192",
+    "--skip-mm-profiling",
+]
+
 SERVER_COMMAND = """\
 podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \\
   --network host --ipc host \\
@@ -46,17 +73,93 @@ podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \\
   --max-model-len 8192 --skip-mm-profiling"""
 
 
-def _check_server(base_url: str) -> str:
-    """Return the served model name, or fail with instructions to start vLLM."""
+def _served_models(base_url: str):
+    """Return the model ids served at base_url, or None if nothing answers."""
     try:
         r = requests.get(f"{base_url}/models", timeout=5)
         r.raise_for_status()
-        models = [m["id"] for m in r.json().get("data", [])]
-    except requests.RequestException as e:
+        return [m["id"] for m in r.json().get("data", [])]
+    except requests.RequestException:
+        return None
+
+
+def _podman(*args, check=False):
+    return subprocess.run(["podman", *args], capture_output=True, text=True, check=check)
+
+
+def start_server(base_url: str = DEFAULT_URL) -> bool:
+    """
+    Make sure a vLLM server answers at base_url, starting one in Podman if not.
+
+    Returns True when this call started the container, so the caller knows to
+    stop it again with stop_server(). Only local URLs are started.
+    """
+    base_url = base_url.rstrip("/")
+    if _served_models(base_url) is not None:
+        return False
+
+    url = urlparse(base_url)
+    if url.hostname not in ("localhost", "127.0.0.1", "::1") or not shutil.which("podman"):
         raise RuntimeError(
-            f"No vLLM server reachable at {base_url} ({e.__class__.__name__}).\n"
-            f"Start one first (Linux + NVIDIA GPU), for example:\n\n{SERVER_COMMAND}\n"
-        ) from None
+            f"No vLLM server reachable at {base_url}, and it cannot be started "
+            f"automatically (needs a local URL and podman). Start one first, "
+            f"for example:\n\n{SERVER_COMMAND}\n"
+        )
+
+    mounts = []
+    for name in ("huggingface", "vllm"):
+        cache = Path.home() / ".cache" / name
+        cache.mkdir(parents=True, exist_ok=True)
+        mounts += ["-v", f"{cache}:/root/.cache/{name}"]
+
+    _podman("rm", "-f", CONTAINER_NAME)
+    cmd = [
+        "run", "-d", "--name", CONTAINER_NAME, *PODMAN_ARGS, *mounts,
+        IMAGE, MODEL_NAME, *VLLM_ARGS, "--port", str(url.port or 8000),
+    ]
+    result = _podman(*cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"podman could not start the vLLM server:\n{result.stderr.strip()}")
+
+    print(
+        f"Starting vLLM server in podman container {CONTAINER_NAME} "
+        "(about 2 minutes; the first run also downloads the image and model)..."
+    )
+    started = time.time()
+    try:
+        while time.time() - started < STARTUP_TIMEOUT:
+            if _served_models(base_url) is not None:
+                print(f"vLLM server ready after {time.time() - started:.0f}s")
+                return True
+            state = _podman("inspect", "-f", "{{.State.Running}}", CONTAINER_NAME)
+            if state.stdout.strip() != "true":
+                logs = _podman("logs", "--tail", "15", CONTAINER_NAME)
+                raise RuntimeError(
+                    "vLLM server exited during startup. Last log lines:\n"
+                    + (logs.stdout + logs.stderr).strip()
+                )
+            time.sleep(2)
+        raise RuntimeError(f"vLLM server not ready after {STARTUP_TIMEOUT // 60} minutes")
+    except BaseException:
+        stop_server()
+        raise
+
+
+def stop_server() -> None:
+    """Stop and remove the container started by start_server()."""
+    print(f"Stopping vLLM server ({CONTAINER_NAME})...")
+    _podman("stop", "-t", "10", CONTAINER_NAME)
+    _podman("rm", "-f", CONTAINER_NAME)
+
+
+def _check_server(base_url: str) -> str:
+    """Return the served model name, or fail with instructions to start vLLM."""
+    models = _served_models(base_url)
+    if models is None:
+        raise RuntimeError(
+            f"No vLLM server reachable at {base_url}. Start one first, "
+            f"for example:\n\n{SERVER_COMMAND}\n"
+        )
     if MODEL_NAME in models:
         return MODEL_NAME
     if len(models) == 1:

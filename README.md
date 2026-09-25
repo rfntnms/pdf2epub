@@ -136,6 +136,7 @@ Options:
   --ocr-engine ENGINE      marker (default), unlimited or vllm
   --vllm-url URL           vLLM server for --ocr-engine vllm (default: http://localhost:8000/v1)
   --vllm-workers INT       Pages sent to the vLLM server at once (default: 8)
+  --vllm-keep-server       Leave an auto-started vLLM server running afterwards
   --skip-epub              Skip EPUB generation, only create markdown
   --skip-md                Skip markdown generation, use existing markdown files
 ```
@@ -222,8 +223,23 @@ following the [vLLM recipe](https://recipes.vllm.ai/baidu/Unlimited-OCR).
 GPU access from Podman needs the NVIDIA Container Toolkit and a CDI spec (on
 Fedora, add NVIDIA's repo from `https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo`
 to `/etc/yum.repos.d/`, then run `sudo dnf install nvidia-container-toolkit` and
-`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). Then start the
-server and leave it running:
+`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). Then:
+
+```bash
+python main.py scanned_book.pdf --ocr-engine vllm
+```
+
+If no server answers at `--vllm-url` and the URL is local, the program starts
+one itself in a Podman container named `pdf2epub-vllm`, waits until it is ready
+(about 2 minutes; the first run also pulls the ~19 GB image and the model), and
+stops it when all PDFs are done, on errors and on Ctrl+C too. The server holds
+most of the GPU memory, so it is not left running. Pass `--vllm-keep-server` to
+leave it running for the next run, which then starts right away; stop it with
+`podman stop pdf2epub-vllm`. A server that was already running is used as is and
+left alone.
+
+To run the server yourself instead (for example on another machine, with
+`--vllm-url` pointing at it), this is the command the program uses:
 
 ```bash
 podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \
@@ -241,11 +257,7 @@ podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \
   --max-model-len 8192 --skip-mm-profiling
 ```
 
-It is ready once `curl localhost:8000/v1/models` answers. Then:
-
-```bash
-python main.py scanned_book.pdf --ocr-engine vllm
-```
+It is ready once `curl localhost:8000/v1/models` answers.
 
 Notes on the server flags:
 
@@ -259,12 +271,15 @@ Notes on the server flags:
   weights and leaves room for ~33k tokens of KV cache, enough for ~12 pages in
   flight. `--skip-mm-profiling` is needed because vLLM would otherwise profile a
   32-tile image, far larger than an A4 page (1 global view + 6 tiles). On a
-  GPU with 16 GB or more, drop these three lines to run the model in bf16.
+  GPU with 16 GB or more, drop these three lines to run the model in bf16
+  (for the auto-started server, edit `VLLM_ARGS` in `modules/vllm_ocr.py`).
 - The two cache mounts keep the weights and vLLM's compiled kernels between
   runs. On an 8 GB card, stop the server before running marker or the
   transformers engine; it holds the GPU memory while it runs.
-- If the server is not reachable, `--ocr-engine vllm` stops with an error that
-  prints this command.
+- If the server is not reachable and cannot be started automatically (a remote
+  `--vllm-url`, or no `podman`), `--ocr-engine vllm` stops with an error that
+  prints this command. If the container exits while starting, the error shows
+  its last log lines.
 
 ### Output Structure
 
